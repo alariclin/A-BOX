@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================A-Box===============================
 # SNI profile: built-in deduplicated maximum REALITY target candidate library; no legacy remote SNI script dependency.
+# Hardened build: stricter GitHub digest trust, guarded shortcut persistence, Fail2Ban validation, and Sing-box HY2 ACME semantics.
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 export LANG=${LANG:-en_US.UTF-8}
@@ -583,6 +584,7 @@ ensure_commands() {
     need_cmd_pkg vnstat vnstat vnstat vnstat
     need_cmd_pkg getent libc-bin glibc-common libc-utils
     need_cmd_pkg flock util-linux util-linux util-linux
+    need_cmd_pkg fail2ban-client fail2ban fail2ban fail2ban
     need_cmd_pkg python3 python3 python3 python3
     if (( ${#missing_pkgs[@]} > 0 )); then
         local unique_pkgs
@@ -642,6 +644,7 @@ service_manager() {
                     sleep 2
                     if ! systemctl is-active --quiet "$srv"; then
                         journalctl -u "$srv" --no-pager -n 80 2>/dev/null || true
+                        case "$srv" in sing-box|hysteria) clean_nat_rules 2>/dev/null || true; save_firewall_rules 2>/dev/null || true ;; esac
                         die "服务 $srv 拉起失败。"
                     fi
                     ;;
@@ -657,6 +660,7 @@ service_manager() {
                     rc-service "$srv" restart 2>/dev/null || true
                     sleep 2
                     if ! rc-service "$srv" status >/dev/null 2>&1; then
+                        case "$srv" in sing-box|hysteria) clean_nat_rules 2>/dev/null || true; save_firewall_rules 2>/dev/null || true ;; esac
                         die "服务 $srv 拉起失败。"
                     fi
                     ;;
@@ -892,26 +896,39 @@ write_if_changed() {
     fi
 }
 
+validate_abox_script_file() {
+    local f="$1" context="${2:-script}"
+    [[ -s "$f" ]] || die "${context} 为空或不存在。"
+    bash -n "$f" || die "${context} 语法校验失败。"
+    grep -q '==============================A-Box===============================' "$f" || die "${context} 文本指纹不匹配。"
+    grep -q '^main "\$@"' "$f" || die "${context} 入口指纹不匹配。"
+}
+
+install_remote_abox_script_guarded() {
+    local url="$1" dest="$2" tmp sha
+    tmp=$(mktemp /tmp/A-Box-script.XXXXXX.sh) || die '远端脚本临时文件创建失败。'
+    curl -fLs --connect-timeout 10 -m 60 "$url" -o "$tmp" || { rm -f "$tmp"; die '远端脚本下载失败。'; }
+    validate_abox_script_file "$tmp" '远端 A-Box 脚本'
+    sha=$(sha256sum "$tmp" | awk '{print $1}')
+    msg "${YELLOW}[*] Remote script SHA256: ${sha}${NC}"
+    confirm_ota_script_hash "$sha" "$url" || { rm -f "$tmp"; die '远端脚本安装被取消。'; }
+    write_if_changed "$dest" "$tmp"
+}
+
 setup_shortcut() {
     mkdir -p "$ABOX_DIR"
-    local script_tmp=''
     if [[ "${1:-}" == 'update' ]]; then
-        script_tmp=$(mktemp /tmp/A-Box-script.XXXXXX.sh) || die '快捷入口临时脚本创建失败。'
-        curl -fLs --connect-timeout 10 "$SCRIPT_URL" -o "$script_tmp" || { rm -f "$script_tmp"; die '快捷入口脚本下载失败。'; }
-        bash -n "$script_tmp" || { rm -f "$script_tmp"; die '更新脚本语法校验失败。'; }
-        grep -q '==============================A-Box===============================' "$script_tmp" || { rm -f "$script_tmp"; die '更新脚本文本指纹不匹配。'; }
-        write_if_changed "$ABOX_DIR/A-Box.sh" "$script_tmp"
+        install_remote_abox_script_guarded "$SCRIPT_URL" "$ABOX_DIR/A-Box.sh"
     elif [[ -f "$0" && -r "$0" && "$0" != 'bash' && "$0" != '-bash' ]]; then
+        validate_abox_script_file "$0" '当前 A-Box 脚本'
         if [[ ! -f "$ABOX_DIR/A-Box.sh" ]] || ! cmp -s "$0" "$ABOX_DIR/A-Box.sh"; then
-            cp -f "$0" "$ABOX_DIR/A-Box.sh"
+            install -m 755 "$0" "$ABOX_DIR/A-Box.sh" || die '持久化当前脚本失败。'
         fi
     elif [[ ! -f "$ABOX_DIR/A-Box.sh" ]]; then
-        script_tmp=$(mktemp /tmp/A-Box-script.XXXXXX.sh) || die '持久化入口临时脚本创建失败。'
-        curl -fLs --connect-timeout 10 "$SCRIPT_URL" -o "$script_tmp" || { rm -f "$script_tmp"; die '无法从远端创建持久化入口。'; }
-        bash -n "$script_tmp" || { rm -f "$script_tmp"; die '持久化脚本语法校验失败。'; }
-        grep -q '==============================A-Box===============================' "$script_tmp" || { rm -f "$script_tmp"; die '持久化脚本文本指纹不匹配。'; }
-        write_if_changed "$ABOX_DIR/A-Box.sh" "$script_tmp"
+        install_remote_abox_script_guarded "$SCRIPT_URL" "$ABOX_DIR/A-Box.sh"
     fi
+    [[ -f "$ABOX_DIR/A-Box.sh" ]] || die '持久化 A-Box 脚本不存在。'
+    validate_abox_script_file "$ABOX_DIR/A-Box.sh" '持久化 A-Box 脚本'
     chmod +x "$ABOX_DIR/A-Box.sh"
 
     local shortcut_tmp
@@ -957,8 +974,10 @@ github_api_get() {
 
 verify_github_asset_digest() {
     local file="$1" digest="${2:-}" expected actual
-    [[ -n "$digest" && "$digest" != 'null' ]] || return 0
-    [[ "$digest" == sha256:* ]] || return 0
+    if [[ -z "$digest" || "$digest" == 'null' ]]; then
+        die 'GitHub Release asset 缺少官方 SHA256 digest，拒绝安装。'
+    fi
+    [[ "$digest" == sha256:* ]] || die 'GitHub Release digest 不是 sha256 格式。'
     expected="${digest#sha256:}"
     [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || die 'GitHub Release digest 格式异常。'
     actual=$(sha256sum "$file" | awk '{print $1}')
@@ -982,10 +1001,7 @@ fetch_github_release() {
     msg "${YELLOW} -> 正在从 GitHub 抓取最新架构版本 [${repo}]...${NC}"
 
     release_json=$(github_api_get "$api_url" 2>/dev/null) || release_json=''
-    if [[ -z "$release_json" ]]; then
-        release_json=$(curl -fLsS --connect-timeout 10 -m 60 "https://ghp.ci/$api_url" 2>/dev/null) || release_json=''
-    fi
-    [[ -n "$release_json" ]] || die 'GitHub Release API 请求失败。'
+    [[ -n "$release_json" ]] || die 'GitHub Release API 请求失败；为保证 digest 信任根，不使用第三方镜像 API。'
 
     asset_json=$(jq -c --arg re "$asset_re" '.assets[]? | select(.name | test($re)) | {url:.browser_download_url,digest:(.digest // "")}' <<< "$release_json" | head -n 1)
     [[ -n "$asset_json" && "$asset_json" != 'null' ]] || die '未能解析核心资产下载地址。'
@@ -1095,6 +1111,22 @@ write_env() {
     chmod 600 "$ABOX_ENV"
 }
 
+validate_fail2ban_config_or_die() {
+    command -v fail2ban-client >/dev/null 2>&1 || return 0
+    local out
+    if fail2ban-client -h 2>&1 | grep -Eq -- '(^|[[:space:]])-t([,[:space:]]|$)|--test'; then
+        out=$(fail2ban-client -t 2>&1) || {
+            printf '%s\n' "$out" >&2
+            die 'Fail2Ban 配置校验失败；已停止部署以避免无效防御配置。'
+        }
+    else
+        out=$(fail2ban-client -d 2>&1) || {
+            printf '%s\n' "$out" >&2
+            die 'Fail2Ban 配置 dump 失败；疑似配置无效，已停止部署。'
+        }
+    fi
+}
+
 setup_active_defense() {
     msg "${YELLOW}[*] 正在挂载环形缓冲日志与 Fail2Ban 主动防御矩阵...${NC}"
     touch /var/log/A-Box-xray-access.log /var/log/A-Box-xray-error.log /var/log/A-Box-singbox.log /var/log/A-Box-hysteria.log 2>/dev/null || true
@@ -1128,7 +1160,10 @@ EOF_F2B_FILTER
         fi
         [[ -n "${SS_PORT:-}" ]] && f2b_ports+="${SS_PORT},"
         f2b_ports="${f2b_ports%,}"
-        [[ -z "$f2b_ports" ]] && f2b_ports='1-65535'
+        if [[ -z "$f2b_ports" ]]; then
+            msg "${YELLOW}[!] 未检测到 A-Box 服务端口，跳过 A-Box Fail2Ban jail。${NC}"
+            return 0
+        fi
         cat > /etc/fail2ban/jail.d/A-Box.local <<EOF_F2B_JAIL
 [A-Box]
 enabled = true
@@ -1144,10 +1179,11 @@ bantime = 3600
 action = iptables-multiport[name=A-Box, port="${f2b_ports}", protocol=tcp]
          iptables-multiport[name=A-Box-udp, port="${f2b_ports}", protocol=udp]
 EOF_F2B_JAIL
+        validate_fail2ban_config_or_die
         if [[ "$INIT_SYS" == 'systemd' ]]; then
-            systemctl restart fail2ban 2>/dev/null || true
+            systemctl restart fail2ban 2>/dev/null || die 'Fail2Ban 重启失败。'
         else
-            rc-service fail2ban restart 2>/dev/null || true
+            rc-service fail2ban restart 2>/dev/null || die 'Fail2Ban 重启失败。'
         fi
     fi
 }
@@ -1334,9 +1370,17 @@ pre_install_setup() {
         HY2_BASE_PORT=$(prompt_port_input "$L_HY2" "$DEF_H_PORT")
 
         if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
-            read -r -ep "   ${L_HY2} Do you have a domain already resolved to this server? (empty = self-signed certificate): " INPUT_H_DOMAIN
+            if [[ "$CORE_IN" == 'singbox' ]]; then
+                read -r -ep "   ${L_HY2} Optional server domain for Sing-box HY2 self-signed certificate/SNI (empty = IP + pinSHA256): " INPUT_H_DOMAIN
+            else
+                read -r -ep "   ${L_HY2} Do you have a domain already resolved to this server? (empty = self-signed certificate): " INPUT_H_DOMAIN
+            fi
         else
-            read -r -ep "   ${L_HY2} 是否拥有已解析到本机的域名？(留空使用默认自签证书): " INPUT_H_DOMAIN
+            if [[ "$CORE_IN" == 'singbox' ]]; then
+                read -r -ep "   ${L_HY2} 可选填写 Sing-box HY2 自签证书/SNI 域名（留空使用 IP + pinSHA256）: " INPUT_H_DOMAIN
+            else
+                read -r -ep "   ${L_HY2} 是否拥有已解析到本机的域名？(留空使用默认自签证书): " INPUT_H_DOMAIN
+            fi
         fi
         HY2_DOMAIN="$INPUT_H_DOMAIN"
         if [[ -n "$HY2_DOMAIN" ]]; then
@@ -1345,7 +1389,7 @@ pre_install_setup() {
             HY2_ACME_TYPE='http'
             HY2_ACME_DNS_PROVIDER=''
             HY2_ACME_DNS_CF_API_TOKEN=''
-            if [[ "$CORE_IN" == 'hysteria' || "$MODE_IN" == *'ALL'* ]]; then
+            if [[ "$CORE_IN" == 'hysteria' || ( "$CORE_IN" == 'xray' && "$MODE_IN" == *'ALL'* ) ]]; then
                 if [[ -n "${ABOX_HY2_ACME_DNS_PROVIDER:-${ABOX_ACME_DNS_PROVIDER:-}}" ]]; then
                     HY2_ACME_TYPE='dns'
                     HY2_ACME_DNS_PROVIDER="${ABOX_HY2_ACME_DNS_PROVIDER:-${ABOX_ACME_DNS_PROVIDER:-}}"
@@ -1446,7 +1490,7 @@ pre_install_setup() {
     msg "${CYAN}======================================================================${NC}\n"
 
     check_selected_ports_free
-    if [[ "$HAS_HY2" == 'true' && -n "${HY2_DOMAIN:-}" && "${HY2_ACME_TYPE:-http}" == 'http' && ( "$CORE_IN" == 'hysteria' || "$MODE_IN" == *'ALL'* ) ]]; then
+    if [[ "$HAS_HY2" == 'true' && -n "${HY2_DOMAIN:-}" && "${HY2_ACME_TYPE:-http}" == 'http' && ( "$CORE_IN" == 'hysteria' || ( "$CORE_IN" == 'xray' && "$MODE_IN" == *'ALL'* ) ) ]]; then
         holder=$(ss -H -n -l -p -A tcp 2>/dev/null | grep -E '[:.]80\b' | grep -vE 'xray|sing-box|hysteria' || true)
         if [[ -n "$holder" ]]; then
             msg "${RED}[!] ACME HTTP-01 需要 80/tcp，但该端口已被非 A-Box 进程占用：${NC}"
@@ -1458,7 +1502,7 @@ pre_install_setup() {
     [[ "$HAS_VISION" == 'true' ]] && allowPort "$VLESS_PORT" tcp
     [[ "$HAS_XHTTP" == 'true' ]] && allowPort "$XHTTP_PORT" tcp
     if [[ "$HAS_HY2" == 'true' ]]; then
-        if [[ -n "$HY2_DOMAIN" && "${HY2_ACME_TYPE:-http}" == 'http' && ( "$CORE_IN" == 'hysteria' || "$MODE_IN" == *'ALL'* ) ]]; then
+        if [[ -n "$HY2_DOMAIN" && "${HY2_ACME_TYPE:-http}" == 'http' && ( "$CORE_IN" == 'hysteria' || ( "$CORE_IN" == 'xray' && "$MODE_IN" == *'ALL'* ) ) ]]; then
             allowPort 80 tcp
         fi
         if [[ "$HY2_HOP" == 'true' ]]; then
@@ -7128,7 +7172,7 @@ light_preflight_check() {
     else
         msg "${YELLOW}[WARN] /etc/os-release not readable${NC}"; warn=$((warn+1))
     fi
-    if command -v systemctl >/dev/null 2>&1; then
+    if systemd_available; then
         msg "${GREEN}[PASS] init: systemd${NC}"
     elif command -v rc-service >/dev/null 2>&1; then
         msg "${GREEN}[PASS] init: OpenRC${NC}"
@@ -7136,13 +7180,13 @@ light_preflight_check() {
         msg "${RED}[FAIL] no supported init system detected${NC}"; fail=$((fail+1))
     fi
     case "$(uname -m)" in x86_64|amd64|aarch64|arm64|armv8*) msg "${GREEN}[PASS] arch: $(uname -m)${NC}" ;; *) msg "${RED}[FAIL] unsupported arch: $(uname -m)${NC}"; fail=$((fail+1)) ;; esac
-    for c in bash curl jq openssl unzip tar iptables ss lsof python3; do
+    for c in bash curl jq openssl unzip tar iptables ss lsof python3 getent flock qrencode fail2ban-client; do
         command -v "$c" >/dev/null 2>&1 || { msg "${YELLOW}[WARN] command missing before dependency sync: $c${NC}"; warn=$((warn+1)); }
     done
     if curl -fsS --connect-timeout 3 -m 6 https://api.github.com >/dev/null 2>&1; then
         msg "${GREEN}[PASS] GitHub API reachable${NC}"
     else
-        msg "${YELLOW}[WARN] GitHub API unreachable now; installer may fall back to mirror${NC}"; warn=$((warn+1))
+        msg "${YELLOW}[WARN] GitHub API unreachable now; official release metadata/digest cannot be verified and core installation may fail${NC}"; warn=$((warn+1))
     fi
     if (( fail > 0 )); then
         die "Lightweight preflight found blocking failures."
@@ -7154,7 +7198,11 @@ preflight_check() {
     local report_dir report fail=0 warn=0 port proto holder now interactive=1
     [[ "${1:-}" == '--no-pause' ]] && interactive=0
     report_dir="$ABOX_DIR/preflight"
-    mkdir -p "$report_dir" 2>/dev/null || true
+    if ! mkdir -p "$report_dir" 2>/dev/null; then
+        local requested_report_dir="$report_dir"
+        report_dir=$(mktemp -d /tmp/A-Box-preflight.XXXXXX) || die 'Preflight report directory creation failed.'
+        msg "${YELLOW}[WARN] Cannot write ${requested_report_dir}; using ${report_dir}${NC}"
+    fi
     report="$report_dir/A-Box-preflight-$(date +%Y%m%d-%H%M%S).txt"
 
     pf_pass() { printf '[PASS] %s\n' "$*" | tee -a "$report"; }
@@ -7173,17 +7221,25 @@ preflight_check() {
     else
         pf_warn '/etc/os-release not readable'
     fi
-    systemd_available && pf_pass 'systemd detected' || { command -v rc-service >/dev/null 2>&1 && pf_pass 'OpenRC detected' || pf_fail 'no supported init system detected'; }
+    if systemd_available; then
+        INIT_SYS='systemd'
+        pf_pass 'systemd detected'
+    elif command -v rc-service >/dev/null 2>&1; then
+        INIT_SYS='openrc'
+        pf_pass 'OpenRC detected'
+    else
+        pf_fail 'no supported init system detected'
+    fi
     case "$(uname -m)" in x86_64|amd64|aarch64|arm64|armv8*) pf_pass "supported CPU architecture: $(uname -m)" ;; *) pf_fail "unsupported CPU architecture: $(uname -m)" ;; esac
 
-    for c in bash curl jq openssl bc unzip tar iptables ss lsof vnstat python3; do
+    for c in bash curl jq openssl bc unzip tar iptables ss lsof vnstat python3 getent flock qrencode fail2ban-client; do
         command -v "$c" >/dev/null 2>&1 && pf_pass "command available: $c" || pf_warn "command missing before dependency sync: $c"
     done
 
     if curl -fsS --connect-timeout 5 -m 10 https://api.github.com >/dev/null 2>&1; then
         pf_pass 'GitHub API reachable'
     else
-        pf_warn 'GitHub API unreachable from this host now'
+        pf_warn 'GitHub API unreachable from this host now; official release metadata/digest cannot be verified and core installation may fail'
     fi
 
     source "$ABOX_ENV" 2>/dev/null || true
@@ -7758,8 +7814,7 @@ confirm_ota_script_hash() {
         die "OTA SHA256 is not in ABOX_OTA_SHA256_ALLOWLIST."
     fi
     if [[ "${ABOX_ASSUME_YES_OTA:-}" == '1' ]]; then
-        msg "${YELLOW}[!] ABOX_ASSUME_YES_OTA=1 set; updating without interactive SHA256 confirmation.${NC}"
-        return 0
+        die 'ABOX_ASSUME_YES_OTA 已禁用；非交互更新必须使用 ABOX_OTA_SHA256_ALLOWLIST。'
     fi
     if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
         msg "${YELLOW}[!] OTA source is the main branch. A syntax/fingerprint check is not a cryptographic signature.${NC}"
@@ -7781,9 +7836,10 @@ update_script() {
     if curl -fLs --connect-timeout 10 "$OTA_URL" -o "$tmp_update"; then
         sha=$(sha256sum "$tmp_update" | awk '{print $1}')
         msg "${YELLOW}[*] OTA SHA256: ${sha}${NC}"
-        if bash -n "$tmp_update" && grep -q '==============================A-Box===============================' "$tmp_update"; then
+        if validate_abox_script_file "$tmp_update" 'OTA A-Box 脚本'; then
             confirm_ota_script_hash "$sha" "$OTA_URL" || { rm -f "$tmp_update"; msg "${YELLOW}[*] OTA update canceled.${NC}"; pause_return; return 0; }
             install -m 755 "$tmp_update" "$ABOX_DIR/A-Box.sh"
+            validate_abox_script_file "$ABOX_DIR/A-Box.sh" '持久化 A-Box 脚本'
             rm -f "$tmp_update"
             msg "${GREEN}核心代码热更新完毕。${NC}"
             sleep 2
@@ -8094,6 +8150,12 @@ run_self_tests() {
     declare -F preflight_check >/dev/null 2>&1 || { echo 'FAIL: preflight_check missing'; failures=$((failures + 1)); }
     declare -F confirm_remote_script_hash >/dev/null 2>&1 || { echo 'FAIL: remote script hash gate missing'; failures=$((failures + 1)); }
     declare -F confirm_ota_script_hash >/dev/null 2>&1 || { echo 'FAIL: OTA hash gate missing'; failures=$((failures + 1)); }
+    declare -F validate_abox_script_file >/dev/null 2>&1 || { echo 'FAIL: local script validation gate missing'; failures=$((failures + 1)); }
+    declare -F install_remote_abox_script_guarded >/dev/null 2>&1 || { echo 'FAIL: guarded remote shortcut installer missing'; failures=$((failures + 1)); }
+    declare -F validate_fail2ban_config_or_die >/dev/null 2>&1 || { echo 'FAIL: fail2ban validation gate missing'; failures=$((failures + 1)); }
+    ( verify_github_asset_digest /dev/null '' ) >/dev/null 2>&1 && { echo 'FAIL: missing GitHub digest must be rejected'; failures=$((failures + 1)); }
+    grep -q "GitHub Release asset digest missing; by"'passed' "$0" && { echo 'FAIL: unsigned GitHub asset bypass must not exist'; failures=$((failures + 1)); }
+    ( ABOX_ASSUME_YES_OTA=1 confirm_ota_script_hash 0000000000000000000000000000000000000000000000000000000000000000 https://example.com/script.sh ) >/dev/null 2>&1 && { echo 'FAIL: ABOX_ASSUME_YES_OTA must be rejected without allowlist'; failures=$((failures + 1)); }
 
     UUID=00000000-0000-4000-8000-000000000000
     VLESS_SNI=www.example.com
@@ -8149,7 +8211,7 @@ main() {
         --help|-h) show_cli_help; exit 0 ;;
         --self-test) run_self_tests; exit $? ;;
         --status) show_status_report; exit 0 ;;
-        --preflight|--dry-run) detect_lang; mkdir -p "$ABOX_DIR"; preflight_check --no-pause; exit $? ;;
+        --preflight|--dry-run) detect_lang; preflight_check --no-pause; exit $? ;;
         --lang)
             ABOX_LANG_OVERRIDE="${2:-zh}"
             enter_runtime "$@"
