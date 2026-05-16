@@ -778,6 +778,27 @@ allowPort() {
     fi
 }
 
+remove_ss_open_accept_rules() {
+    local proto rule
+    [[ -n "${SS_PORT:-}" ]] || return 0
+    for proto in tcp udp; do
+        while $IPT -w -S INPUT 2>/dev/null | grep -F "A-Box-${SS_PORT}-${proto}" | grep -F -- '-j ACCEPT' | grep -Ev "A-Box-${SS_PORT}-${proto}-(WL|DROP)" >/dev/null; do
+            rule=$($IPT -w -S INPUT 2>/dev/null | grep -F "A-Box-${SS_PORT}-${proto}" | grep -F -- '-j ACCEPT' | grep -Ev "A-Box-${SS_PORT}-${proto}-(WL|DROP)" | head -n 1 | sed 's/^-A /-D /')
+            [[ -z "$rule" ]] && break
+            # shellcheck disable=SC2086
+            $IPT -w $rule >/dev/null 2>&1 || break
+        done
+        if command -v ip6tables >/dev/null 2>&1 && $IPT6 -w -S INPUT >/dev/null 2>&1; then
+            while $IPT6 -w -S INPUT 2>/dev/null | grep -F "A-Box-${SS_PORT}-${proto}" | grep -F -- '-j ACCEPT' | grep -Ev "A-Box-${SS_PORT}-${proto}-(WL6|WL|DROP6|DROP)" >/dev/null; do
+                rule=$($IPT6 -w -S INPUT 2>/dev/null | grep -F "A-Box-${SS_PORT}-${proto}" | grep -F -- '-j ACCEPT' | grep -Ev "A-Box-${SS_PORT}-${proto}-(WL6|WL|DROP6|DROP)" | head -n 1 | sed 's/^-A /-D /')
+                [[ -z "$rule" ]] && break
+                # shellcheck disable=SC2086
+                $IPT6 -w $rule >/dev/null 2>&1 || break
+            done
+        fi
+    done
+}
+
 clean_nat_rules() {
     local rule
     while $IPT -w -t nat -S PREROUTING 2>/dev/null | grep -q 'A-Box-HY2-HOP'; do
@@ -1514,6 +1535,7 @@ pre_install_setup() {
     fi
     if [[ "$HAS_SS" == 'true' ]]; then
         if [[ -n "${SS_WHITELIST_IP:-}" ]]; then
+            remove_ss_open_accept_rules
             for ip in $SS_WHITELIST_IP; do
                 for proto in tcp udp; do
                     if [[ "$ip" == *:* ]]; then
@@ -2222,6 +2244,7 @@ manage_ss_whitelist() {
             pause_return
             ;;
         3)
+            remove_ss_open_accept_rules
             for proto in tcp udp; do
                 if ! $IPT -w -C INPUT -p "$proto" --dport "$SS_PORT" -j DROP 2>/dev/null; then
                     $IPT -w -A INPUT -p "$proto" --dport "$SS_PORT" -m comment --comment "A-Box-${SS_PORT}-${proto}-DROP" -j DROP >/dev/null 2>&1 || die "IPv4 SS DROP 规则写入失败: $proto"
@@ -6861,6 +6884,48 @@ run_builtin_sni_radar() {
     rm -rf "$workdir"
 }
 
+show_sni_preference_records() {
+    clear
+    local files=() f profile topn=35 shown=0 mtime
+    msg "${CYAN}======================================================================${NC}"
+    if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
+        msg "${BOLD}${GREEN}SNI Preference Records${NC}"
+    else
+        msg "${BOLD}${GREEN}SNI 优选记录${NC}"
+    fi
+    msg "${CYAN}======================================================================${NC}"
+    for f in "$ABOX_DIR/A-Box-sni-full.tsv" "$ABOX_DIR/A-Box-sni-mini.tsv"; do
+        [[ -s "$f" ]] && files+=("$f")
+    done
+    if (( ${#files[@]} == 0 )); then
+        if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
+            msg "${YELLOW}[!] No SNI preference record found. Run Toolbox option 3 or 4 first.${NC}"
+        else
+            msg "${YELLOW}[!] 未发现 SNI 优选记录。请先运行工具箱 3 或 4。${NC}"
+        fi
+        pause_return
+        return 0
+    fi
+    for f in "${files[@]}"; do
+        profile="${f##*/A-Box-sni-}"
+        profile="${profile%.tsv}"
+        mtime=$(date -r "$f" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 'unknown')
+        msg "${BLUE}----------------------------------------------------------------------${NC}"
+        if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
+            msg "${YELLOW}[${profile}] Saved: ${f} | Updated: ${mtime}${NC}"
+        else
+            msg "${YELLOW}[${profile}] 保存路径: ${f} | 更新时间: ${mtime}${NC}"
+        fi
+        awk -F'	' -v n="$topn" 'NF>=8 && NR<=n {printf "%2d. %-42s %s %s %s %s %s %s %s %s %s\n", NR, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12}' "$f"
+        shown=1
+    done
+    msg "${BLUE}----------------------------------------------------------------------${NC}"
+    if [[ "$shown" == '1' ]]; then
+        msg "${YELLOW}Use only domains with tls13=1 and san=1. Prefer asnmatch=1/samecountry=1 when available.${NC}"
+    fi
+    pause_return
+}
+
 run_local_sni_benchmark() {
     if confirm_yes_no "$(tr_msg confirm_local_sni_full)"; then
         run_builtin_sni_radar 'full' 'Local SNI preference / 本地 SNI 优选'
@@ -7288,6 +7353,7 @@ vps_benchmark_menu() {
         msg "${YELLOW}7. Backup / Restore A-Box configuration${NC}"
         msg "${YELLOW}8. Export redacted diagnostic bundle${NC}"
         msg "${YELLOW}9. Full dry-run preflight check${NC}"
+        msg "${YELLOW}10. SNI preference records${NC}"
         msg "${GREEN}0. Back${NC}"
     else
         msg "${YELLOW}1. 本机配置和下载测速${NC}"
@@ -7299,10 +7365,11 @@ vps_benchmark_menu() {
         msg "${YELLOW}7. 配置备份 / 恢复${NC}"
         msg "${YELLOW}8. 导出脱敏诊断包${NC}"
         msg "${YELLOW}9. 完整 Dry-run 预检查${NC}"
+        msg "${YELLOW}10. SNI 优选记录${NC}"
         msg "${GREEN}0. 返回主菜单${NC}"
     fi
     local bench_choice
-    read -r -ep 'Select [0-9]: ' bench_choice
+    read -r -ep 'Select [0-10]: ' bench_choice
     case "$bench_choice" in
         1)
             confirm_yes_no "$(printf "$(tr_msg confirm_remote)" 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
@@ -7319,6 +7386,7 @@ vps_benchmark_menu() {
         7) backup_restore_menu ;;
         8) export_diagnostic_bundle ;;
         9) preflight_check ;;
+        10) show_sni_preference_records ;;
         *) return 0 ;;
     esac
 }
@@ -7733,7 +7801,7 @@ show_usage() {
 
 [Operations]
 11 Toolbox
-   System benchmark/download speed; IP quality/streaming unlock/route test; built-in full SNI preference library; built-in mini-host SNI preference library; Cloudflare WARP manager; 2G Swap allocation; Backup/Restore; redacted diagnostic bundle export; full dry-run preflight check. Lightweight preflight runs automatically before protocol deployment; backups are offered or created before destructive maintenance/core upgrade actions.
+   System benchmark/download speed; IP quality/streaming unlock/route test; built-in full SNI preference library; built-in mini-host SNI preference library; SNI preference record viewer; Cloudflare WARP manager; 2G Swap allocation; Backup/Restore; redacted diagnostic bundle export; full dry-run preflight check. Lightweight preflight runs automatically before protocol deployment; backups are offered or created before destructive maintenance/core upgrade actions.
 12 VPS One-click Optimization
    BBR/FQ, file descriptor limits, KeepAlive injection, health probe, logrotate/fail2ban defense.
 13 Display Node Parameters
@@ -7741,7 +7809,7 @@ show_usage() {
 14 Manual
    This page.
 15 OTA, Geo and Core-only Upgrade
-   Update A-Box script, Xray Loyalsoldier geoip/geosite data, or upgrade installed proxy core binaries without resetting node parameters.
+   Update A-Box script with Y/N confirmation after SHA256 display, update Xray Loyalsoldier geoip/geosite data, or upgrade installed proxy core binaries without resetting node parameters.
 16 Full/Partial Uninstall
    Remove proxy stack, firewall rules, services and optional sb shortcut.
 17 Environment Reset
@@ -7749,7 +7817,7 @@ show_usage() {
 18 Monthly Traffic Limit
    vnStat-based monthly traffic cap; stop services after reaching quota.
 19 SS-2022 Whitelist Manager
-   Add/remove frontend IP/CIDR and enforce DROP for non-whitelisted sources.
+   Add/remove frontend IP/CIDR whitelist entries. Non-whitelisted sources are dropped when whitelist mode is enabled; switching from open mode removes stale global ACCEPT rules first.
 20 Language
    Switch Chinese/English UI and save to /etc/ddr/.lang.
 EOF_USAGE
@@ -7779,7 +7847,7 @@ EOF_USAGE
 
 【运维类】
 11 综合工具箱
-   本机配置/下载测速；IP纯净度/流媒体解锁/回程测试；内置全量SNI优选库；内置微型主机SNI优选库；Cloudflare WARP接管；2G Swap划拨；配置备份/恢复；脱敏诊断包导出；完整 Dry-run 预检查。
+   本机配置/下载测速；IP纯净度/流媒体解锁/回程测试；内置全量SNI优选库；内置微型主机SNI优选库；SNI 优选记录查看；Cloudflare WARP接管；2G Swap划拨；配置备份/恢复；脱敏诊断包导出；完整 Dry-run 预检查。
 12 VPS 一键优化
    BBR/FQ、文件句柄、KeepAlive、健康探针、logrotate/fail2ban防御。
 13 全部节点参数显示
@@ -7787,7 +7855,7 @@ EOF_USAGE
 14 脚本说明书
    当前页面。
 15 脚本 OTA、Xray Geo 与核心无损升级
-   更新 A-Box 主脚本、Xray Loyalsoldier geoip/geosite 数据，或仅升级当前已安装协议核心且不重置节点参数。
+   更新 A-Box 主脚本（显示 SHA256 后使用 Y/N 确认）、Xray Loyalsoldier geoip/geosite 数据，或仅升级当前已安装协议核心且不重置节点参数。
 16 一键全部清空卸载
    删除代理栈、服务、防火墙规则，可选择是否保留 sb 快捷入口。
 17 删除全部节点与环境初始化
@@ -7795,7 +7863,7 @@ EOF_USAGE
 18 每月流量管控限制
    基于 vnStat 设置月流量阈值，达到后自动停止服务。
 19 SS-2022 白名单 IP 管理
-   添加/删除前置机 IP/CIDR，对非白名单来源执行 DROP。
+   添加/删除前置机 IP/CIDR，对非白名单来源执行 DROP；从全网开放切回白名单时会先移除旧的全局 ACCEPT 规则。
 20 语言设置
    中英文切换，持久化保存至 /etc/ddr/.lang。
 EOF_USAGE
@@ -7819,13 +7887,13 @@ confirm_ota_script_hash() {
     if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
         msg "${YELLOW}[!] OTA source is the main branch. A syntax/fingerprint check is not a cryptographic signature.${NC}"
         msg "${YELLOW}[!] Source: ${url}${NC}"
-        read -r -ep 'Type YES-UPDATE-MAIN to install this downloaded script: ' answer
+        read -r -ep 'Install this downloaded A-Box script? [Y/N]: ' answer
     else
         msg "${YELLOW}[!] OTA 来源为 main 分支。语法/指纹检查不是密码学签名。${NC}"
         msg "${YELLOW}[!] 来源：${url}${NC}"
-        read -r -ep '输入 YES-UPDATE-MAIN 才安装此下载脚本: ' answer
+        read -r -ep '是否安装此下载的 A-Box 脚本？[Y/N]: ' answer
     fi
-    [[ "$answer" == 'YES-UPDATE-MAIN' ]] || return 130
+    is_yes "$answer" || return 130
 }
 
 update_script() {
@@ -8150,6 +8218,8 @@ run_self_tests() {
     declare -F preflight_check >/dev/null 2>&1 || { echo 'FAIL: preflight_check missing'; failures=$((failures + 1)); }
     declare -F confirm_remote_script_hash >/dev/null 2>&1 || { echo 'FAIL: remote script hash gate missing'; failures=$((failures + 1)); }
     declare -F confirm_ota_script_hash >/dev/null 2>&1 || { echo 'FAIL: OTA hash gate missing'; failures=$((failures + 1)); }
+    declare -F remove_ss_open_accept_rules >/dev/null 2>&1 || { echo 'FAIL: SS open ACCEPT cleanup missing'; failures=$((failures + 1)); }
+    declare -F show_sni_preference_records >/dev/null 2>&1 || { echo 'FAIL: SNI record viewer missing'; failures=$((failures + 1)); }
     declare -F validate_abox_script_file >/dev/null 2>&1 || { echo 'FAIL: local script validation gate missing'; failures=$((failures + 1)); }
     declare -F install_remote_abox_script_guarded >/dev/null 2>&1 || { echo 'FAIL: guarded remote shortcut installer missing'; failures=$((failures + 1)); }
     declare -F validate_fail2ban_config_or_die >/dev/null 2>&1 || { echo 'FAIL: fail2ban validation gate missing'; failures=$((failures + 1)); }
