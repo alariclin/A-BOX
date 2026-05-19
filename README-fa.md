@@ -2,7 +2,8 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-<img width="1254" alt="بنر پروژه A-Box" src="https://github.com/user-attachments/assets/d45171b6-17f2-45da-9c60-e6b8b64301c1" />
+<img width="1254" height="1254" alt="abox" src="https://github.com/user-attachments/assets/2d4f369a-144b-4128-aac0-bfce882adf13" />
+
 
 **A-Box** یک ابزار خودکار یکپارچه برای سرورهای Linux است. این ابزار deployment سرویس‌های proxy، system tuning، traffic management، access control، health checks، client configuration export، network quality tests، maintenance safeguards و Chinese/English terminal UI را در یک Bash script مستقل جمع می‌کند.
 
