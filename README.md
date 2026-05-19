@@ -2,7 +2,8 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-<img width="1254" alt="A-Box Project Banner" src="https://github.com/user-attachments/assets/a3d48aac-b33d-4061-918c-1d1e93e3cee2" />
+<img width="1254" height="1254" alt="abox" src="https://github.com/user-attachments/assets/4907a119-d785-4d4e-bd39-92ba32706b78" />
+
 
 **A-Box** is an all-in-one Linux network gateway automation toolkit. It integrates proxy service deployment, system tuning, traffic management, access control, service health checks, client configuration export, network quality testing, maintenance safeguards, and a bilingual terminal UI into one standalone Bash script.
 
